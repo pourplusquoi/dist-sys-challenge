@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Response {
     EchoOk(EchoOkResponse),
     GenerateOk(GenerateOkResponse),
+    BroadcastOk,
+    ReadOk(ReadOkResponse),
+    TopologyOk,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -15,4 +18,9 @@ pub(crate) struct EchoOkResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct GenerateOkResponse {
     pub(crate) id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub(crate) struct ReadOkResponse {
+    pub(crate) messages: Vec<u64>,
 }
