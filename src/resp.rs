@@ -6,7 +6,6 @@ pub(crate) enum Response {
     AddOk,
     ReadOk(ReadOkResponse),
     BroadcastOk,
-    BroadcastErr,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

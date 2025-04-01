@@ -1,8 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering}, Arc, Mutex, RwLock
     },
     time::Duration,
 };
@@ -31,7 +30,7 @@ async fn try_main() -> Result<()> {
 struct Handler {
     value: AtomicU64,
     serial: AtomicU64,
-    recved: Mutex<HashMap<String, u64>>,
+    received: RwLock<HashMap<String, Mutex<(u64, HashSet<u64>)>>>,
 }
 
 #[async_trait]
@@ -56,47 +55,71 @@ impl Handler {
         Self {
             value: AtomicU64::new(0),
             serial: AtomicU64::new(1),
-            recved: Mutex::new(HashMap::new()),
+            received: RwLock::new(HashMap::new()),
         }
     }
 
     async fn add(&self, runtime: &Runtime, req: AddRequest) -> Result<Response> {
-        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
-        self.value.fetch_add(req.delta, Ordering::Relaxed);
+        let serial = self.serial.fetch_add(1, Ordering::SeqCst);
+        self.value.fetch_add(req.delta, Ordering::SeqCst);
+        let from = runtime.node_id();
         for to in runtime.neighbours() {
-            self.broadcast_inner(runtime, to, serial, req.delta);
+            self.broadcast_inner(runtime, from, to, serial, req.delta);
         }
         Ok(Response::AddOk)
     }
 
     async fn read(&self) -> Result<Response> {
-        let value = self.value.load(Ordering::Relaxed);
+        let value = self.value.load(Ordering::SeqCst);
         let resp = ReadOkResponse { value };
         Ok(Response::ReadOk(resp))
     }
 
     async fn broadcast(&self, runtime: &Runtime, req: BroadcastRequest) -> Result<Response> {
-        let mut guard = self.recved.lock().unwrap();
-        let latest = guard.entry(req.node).or_default();
-        if req.serial <= *latest {
+        if req.from == runtime.node_id() {
             return Ok(Response::BroadcastOk);
         }
-        if req.serial > *latest + 1 {
-            return Ok(Response::BroadcastErr);
+        {
+            self.received.write().unwrap().entry(req.from.clone()).or_default();
+            let guard = self.received.read().unwrap();
+            let mut latest = guard.get(&req.from).unwrap().lock().unwrap();
+            if req.serial < latest.0 + 1 {
+                return Ok(Response::BroadcastOk);
+            }
+            if req.serial > latest.0 + 1 {
+                latest.1.insert(req.serial);
+            } else {
+                latest.0 = req.serial;
+                latest.1.remove(&req.serial);
+                for x in (req.serial + 1).. {
+                    if !latest.1.remove(&x) {
+                        break;
+                    }
+                    latest.0 = x;
+                }
+            }
         }
-        self.value.fetch_add(req.delta, Ordering::Relaxed);
+        self.value.fetch_add(req.delta, Ordering::SeqCst);
+        let from = req.from.as_str();
         for to in runtime.neighbours() {
-            self.broadcast_inner(runtime, to, req.serial, req.delta);
+            self.broadcast_inner(runtime, from, to, req.serial, req.delta);
         }
         Ok(Response::BroadcastOk)
     }
 
-    fn broadcast_inner(&self, runtime: &Runtime, to: &str, serial: u64, delta: u64) {
-        let from = runtime.node_id().to_string();
-        let to = to.to_string();
+    fn broadcast_inner(
+        &self,
+        runtime: &Runtime,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        serial: u64,
+        delta: u64,
+    ) {
+        let from = from.into();
+        let to = to.into();
         let rt = runtime.clone();
         let req = Request::Broadcast(BroadcastRequest {
-            node: from,
+            from,
             serial,
             delta,
         });

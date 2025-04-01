@@ -15,7 +15,7 @@ pub(crate) struct AddRequest {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct BroadcastRequest {
-    pub(crate) node: String,
+    pub(crate) from: String,
     pub(crate) serial: u64,
     pub(crate) delta: u64,
 }
