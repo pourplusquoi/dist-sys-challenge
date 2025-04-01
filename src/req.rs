@@ -1,28 +1,21 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub(crate) enum Request {
-    Echo(EchoRequest),
-    Generate,
-    Broadcast(BroadcastRequest),
+    Add(AddRequest),
     Read,
-    Topology(TopologyRequest),
+    Broadcast(BroadcastRequest),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct EchoRequest {
-    pub(crate) echo: String,
+pub(crate) struct AddRequest {
+    pub(crate) delta: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct BroadcastRequest {
-    pub(crate) message: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct TopologyRequest {
-    pub(crate) topology: HashMap<String, Vec<String>>,
+    pub(crate) node: String,
+    pub(crate) serial: u64,
+    pub(crate) delta: u64,
 }
