@@ -10,7 +10,7 @@ use tokio_context::context::Context;
 
 pub(crate) mod types;
 
-use crate::types::{Operation, Request, Response, TxnRequest, TxnResponse};
+use types::{Operation, Request, Response, TxnRequest, TxnResponse};
 
 pub(crate) fn main() -> Result<()> {
     Runtime::init(try_main())
@@ -49,11 +49,6 @@ impl Handler {
     }
 
     async fn txn(&self, req: TxnRequest) -> Result<Response> {
-        let resp = self.txn_inner(req.clone()).await?;
-        Ok(Response::TxnOk(resp))
-    }
-
-    async fn txn_inner(&self, req: TxnRequest) -> Result<TxnResponse> {
         let mut txn = Vec::new();
         let mut workspace = HashMap::new();
         let lock = Lock::new(&self.store, "txn".into());
@@ -85,7 +80,7 @@ impl Handler {
             }
         }
         lock.release().await?;
-        Ok(TxnResponse { txn })
+        Ok(Response::TxnOk(TxnResponse { txn }))
     }
 }
 
