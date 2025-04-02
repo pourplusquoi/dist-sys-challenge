@@ -1,25 +1,16 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use maelstrom::{Node, Result, Runtime, done, protocol::Message};
-use serde::Serialize;
-use tokio::sync::OnceCell;
+use maelstrom::{
+    Error, Node, Result, Runtime, done,
+    kv::{KV, Storage},
+    protocol::Message,
+};
 use tokio_context::context::Context;
 
-pub(crate) mod req;
-pub(crate) mod resp;
+pub(crate) mod types;
 
-use crate::{
-    req::{
-        CommitOffsetsRequest, ListCommittedOffsetsRequest, PollRequest,
-        ReplicateCommitOffsetsRequest, ReplicateSendRequest, Request, SendRequest,
-    },
-    resp::{ListCommittedOffsetsResponse, PollResponse, Response, SendResponse},
-};
+use crate::types::{Operation, Request, Response, TxnRequest, TxnResponse};
 
 pub(crate) fn main() -> Result<()> {
     Runtime::init(try_main())
@@ -27,27 +18,12 @@ pub(crate) fn main() -> Result<()> {
 
 async fn try_main() -> Result<()> {
     let runtime = Runtime::new();
-    let handler = Arc::new(Handler::default());
+    let handler = Arc::new(Handler::new(runtime.clone()));
     runtime.with_handler(handler).run().await
 }
 
-#[derive(PartialEq, Eq)]
-enum Role {
-    Leader,
-    Follower,
-}
-
-#[derive(Default)]
 struct Handler {
-    entries: RwLock<HashMap<String, Entry>>,
-    once: OnceCell<(Role, String)>,
-}
-
-#[derive(Default)]
-struct Entry {
-    commited: u64,
-    latest: u64,
-    logs: BTreeMap<u64, u64>,
+    store: Storage,
 }
 
 #[async_trait]
@@ -56,14 +32,7 @@ impl Node for Handler {
         match req.body.as_obj::<Request>() {
             Ok(r) => {
                 let resp = match r {
-                    Request::Send(req) => self.send(&runtime, req).await,
-                    Request::Poll(req) => self.poll(req).await,
-                    Request::CommitOffsets(req) => self.commit_offsets(&runtime, req).await,
-                    Request::ListCommittedOffsets(req) => self.list_committed_offsets(req).await,
-                    Request::ReplicateSend(req) => self.replicate_send(req).await,
-                    Request::ReplicateCommitOffsets(req) => {
-                        self.replicate_commit_offsets(req).await
-                    }
+                    Request::Txn(req) => self.txn(req).await,
                 }?;
                 runtime.reply(req, resp).await
             }
@@ -73,161 +42,89 @@ impl Node for Handler {
 }
 
 impl Handler {
-    async fn send(&self, runtime: &Runtime, req: SendRequest) -> Result<Response> {
-        let (role, leader) = self
-            .once
-            .get_or_try_init(|| Self::elect_leader(runtime))
-            .await?;
-        match role {
-            Role::Leader => {
-                let offset = self.send_inner(req.key.clone(), req.msg).await?;
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            store: maelstrom::kv::lin_kv(runtime),
+        }
+    }
 
-                let req = ReplicateSendRequest {
-                    key: req.key,
-                    msg: req.msg,
-                };
-                for to in runtime.neighbours() {
-                    let to = to.clone();
-                    let rt = runtime.clone();
-                    let req = req.clone();
-                    runtime.spawn(async move {
-                        loop {
-                            if let Ok(Response::ReplicateSendOk) =
-                                Self::call(&rt, &to, req.clone()).await
-                            {
-                                break;
-                            }
+    async fn txn(&self, req: TxnRequest) -> Result<Response> {
+        let resp = self.txn_inner(req.clone()).await?;
+        Ok(Response::TxnOk(resp))
+    }
+
+    async fn txn_inner(&self, req: TxnRequest) -> Result<TxnResponse> {
+        let mut txn = Vec::new();
+        let mut workspace = HashMap::new();
+        let lock = Lock::new(&self.store, "txn".into());
+        lock.acquire().await?;
+        for (op, key, val) in req.txn {
+            match op {
+                Operation::Read => {
+                    let mut val = None;
+                    if let Some(v) = workspace.get(&key) {
+                        val = Some(*v);
+                    } else {
+                        let (ctx, _h) = Context::new();
+                        if let Ok(v) = self.store.get::<u64>(ctx, format!("{key}")).await {
+                            val = Some(v);
                         }
-                    });
+                    }
+                    txn.push((Operation::Read, key, val));
                 }
-
-                let resp = SendResponse { offset };
-                Ok(Response::SendOk(resp))
+                Operation::Write => {
+                    workspace.insert(key, val.unwrap());
+                    txn.push((Operation::Write, key, val));
+                }
             }
-            Role::Follower => Self::call(runtime, leader, req).await,
+        }
+        if !workspace.is_empty() {
+            for (key, val) in workspace {
+                let (ctx, _h) = Context::new();
+                self.store.put(ctx, format!("{key}"), val).await?;
+            }
+        }
+        lock.release().await?;
+        Ok(TxnResponse { txn })
+    }
+}
+
+fn is_precondition_failed(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    e.downcast_ref::<Error>() == Some(&Error::PreconditionFailed)
+}
+
+struct Lock<'a> {
+    store: &'a Storage,
+    key: String,
+}
+
+impl<'a> Lock<'a> {
+    fn new(store: &'a Storage, key: String) -> Self {
+        Self { store, key }
+    }
+
+    async fn acquire(&self) -> Result<()> {
+        loop {
+            match self.try_acquire().await {
+                Err(e) if is_precondition_failed(&*e) => {
+                    std::thread::yield_now();
+                }
+                r => break r,
+            }
         }
     }
 
-    async fn replicate_send(&self, req: ReplicateSendRequest) -> Result<Response> {
-        self.send_inner(req.key, req.msg).await?;
-        Ok(Response::ReplicateSendOk)
-    }
-
-    async fn send_inner(&self, key: String, msg: u64) -> Result<u64> {
-        let mut guard = self.entries.write().unwrap();
-        let entry = guard.entry(key).or_default();
-        entry.latest += 1;
-        entry.logs.insert(entry.latest, msg);
-        Ok(entry.latest)
-    }
-
-    async fn poll(&self, req: PollRequest) -> Result<Response> {
-        const LIMIT: usize = 8;
-        let mut resp = PollResponse::default();
-        let guard = self.entries.read().unwrap();
-        for (key, offset) in req.offsets {
-            let mut msgs = Vec::with_capacity(LIMIT);
-            if let Some(entry) = guard.get(&key) {
-                for log in entry
-                    .logs
-                    .iter()
-                    .skip_while(|log| *log.0 < offset)
-                    .take(LIMIT)
-                    .map(|(x, y)| (*x, *y))
-                {
-                    msgs.push(log);
-                }
-            }
-            resp.msgs.insert(key, msgs);
-        }
-        Ok(Response::PollOk(resp))
-    }
-
-    async fn commit_offsets(
-        &self,
-        runtime: &Runtime,
-        req: CommitOffsetsRequest,
-    ) -> Result<Response> {
-        let (role, leader) = self
-            .once
-            .get_or_try_init(|| Self::elect_leader(runtime))
+    async fn try_acquire(&self) -> Result<()> {
+        let (ctx, _h) = Context::new();
+        self.store
+            .cas(ctx, self.key.clone(), "", "locked", true)
             .await?;
-        match role {
-            Role::Leader => {
-                self.commit_offsets_inner(req.offsets.clone()).await?;
-
-                let req = ReplicateCommitOffsetsRequest {
-                    offsets: req.offsets,
-                };
-                for to in runtime.neighbours() {
-                    let to = to.clone();
-                    let rt = runtime.clone();
-                    let req = req.clone();
-                    runtime.spawn(async move {
-                        loop {
-                            if let Ok(Response::ReplicateCommitOffsetsOk) =
-                                Self::call(&rt, &to, req.clone()).await
-                            {
-                                break;
-                            }
-                        }
-                    });
-                }
-
-                Ok(Response::CommitOffsetsOk)
-            }
-            Role::Follower => Self::call(runtime, leader, req).await,
-        }
-    }
-
-    async fn replicate_commit_offsets(
-        &self,
-        req: ReplicateCommitOffsetsRequest,
-    ) -> Result<Response> {
-        self.commit_offsets_inner(req.offsets).await?;
-        Ok(Response::ReplicateCommitOffsetsOk)
-    }
-
-    async fn commit_offsets_inner(&self, offsets: HashMap<String, u64>) -> Result<()> {
-        let mut guard = self.entries.write().unwrap();
-        for (key, offset) in offsets {
-            if let Some(entry) = guard.get_mut(&key) {
-                entry.commited = offset;
-            }
-        }
         Ok(())
     }
 
-    async fn list_committed_offsets(&self, req: ListCommittedOffsetsRequest) -> Result<Response> {
-        let mut resp = ListCommittedOffsetsResponse::default();
-        let guard = self.entries.read().unwrap();
-        for key in req.keys {
-            if let Some(entry) = guard.get(&key) {
-                resp.offsets.insert(key, entry.commited);
-            }
-        }
-        Ok(Response::ListCommittedOffsetsOk(resp))
-    }
-
-    async fn call(
-        runtime: &Runtime,
-        to: impl Into<String>,
-        req: impl Serialize,
-    ) -> Result<Response> {
-        let (ctx, _) = Context::with_timeout(Duration::from_secs(1));
-        let msg = runtime.call(ctx, to, req).await?;
-        msg.body.as_obj::<Response>()
-    }
-
-    async fn elect_leader(runtime: &Runtime) -> Result<(Role, String)> {
-        // TODO(panyang): Hard coded.
-        let leader = "n0".to_string();
-        let curr = runtime.node_id();
-        let role = if leader == curr {
-            Role::Leader
-        } else {
-            Role::Follower
-        };
-        Ok((role, leader))
+    async fn release(&self) -> Result<()> {
+        let (ctx, _h) = Context::new();
+        self.store.put(ctx, self.key.clone(), "").await?;
+        Ok(())
     }
 }
