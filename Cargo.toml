@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.88"
+log = "0.4.27"
 maelstrom-node = "0.1.6"
 serde = "1.0.219"
+tokio = "1.44.1"
 tokio-context = "0.1.3"
